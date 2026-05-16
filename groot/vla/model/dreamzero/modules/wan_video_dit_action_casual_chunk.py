@@ -1426,6 +1426,21 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.gradient_checkpointing = True
         self.independent_first_frame = False if self.num_frame_per_block == 1 else True
 
+    def compile_dit_blocks(self):
+        """Env-gated torch.compile of DiT blocks.
+
+        Must be called AFTER loading the pretrained WAN checkpoint:
+        torch.compile wraps each block in OptimizedModule and adds a
+        `._orig_mod.` prefix to its state_dict keys, so compiling first
+        would make every DiT-block key in the checkpoint report as
+        missing on load.
+        """
+        if os.environ.get("DREAMZERO_COMPILE", "0") != "1":
+            return
+        _mode = os.environ.get("DREAMZERO_COMPILE_MODE", "default")
+        print(f"[DreamZero] torch.compile {len(self.blocks)} DiT blocks (mode={_mode})", flush=True)
+        for i in range(len(self.blocks)):
+            self.blocks[i] = torch.compile(self.blocks[i], mode=_mode)
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
@@ -2243,3 +2258,19 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # init output layer
         nn.init.zeros_(self.head.head.weight)
+
+        # Re-init CategorySpecificLinear.W from a dedicated CPU Generator.
+        # `.W` is a raw nn.Parameter (not nn.Linear.weight), so the loops
+        # above skip it; its construction-time torch.randn consumes the
+        # global RNG, which means any upstream code that touches the global
+        # RNG leaves these weights different across configs even with the
+        # same manual_seed. A dedicated fixed-seed Generator decouples this
+        # init from the global stream so the values are config-independent.
+        _w_gen = torch.Generator(device='cpu').manual_seed(42)
+        with torch.no_grad():
+            for m in self.modules():
+                if isinstance(m, CategorySpecificLinear):
+                    new_w = 0.02 * torch.randn(
+                        m.W.shape, generator=_w_gen, dtype=m.W.dtype
+                    )
+                    m.W.copy_(new_w.to(m.W.device))

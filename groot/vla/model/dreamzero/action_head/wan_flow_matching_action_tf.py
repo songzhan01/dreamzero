@@ -148,6 +148,14 @@ class WANPolicyHeadConfig(PretrainedConfig):
     image_encoder_cfg: dict = field(default=None)
     vae_cfg: dict = field(default=None)
 
+    # Optional T5 prompt-embedding cache. Env DREAMZERO_T5_CACHE_PATH
+    # overrides this value at runtime; if neither resolves to an existing
+    # path, the live T5 forward is used.
+    t5_cache_path: str = field(
+        default=None,
+        metadata={"help": "LMDB-backed T5 prompt cache directory. Env DREAMZERO_T5_CACHE_PATH overrides."},
+    )
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():
@@ -171,13 +179,43 @@ class WANPolicyHead(ActionHead):
         self.num_frame_per_block = config.num_frame_per_block
         self.hidden_size = config.hidden_size
         self.num_frames = config.num_frames
-        self.text_encoder = instantiate(config.text_encoder_cfg)
+
+        # T5 prompt cache resolution: env > config > None.
+        # Set to "" → explicit disable. Nonexistent path falls back to
+        # in-process T5 with a warn.
+        env_path_raw = os.getenv("DREAMZERO_T5_CACHE_PATH")
+        cfg_path = getattr(config, "t5_cache_path", None)
+        if env_path_raw is None:
+            resolved_path = cfg_path or None
+        else:
+            env_path_stripped = env_path_raw.strip()
+            resolved_path = env_path_stripped if env_path_stripped else None
+        if resolved_path and not os.path.exists(resolved_path):
+            print(
+                f"[T5Cache] cache path {resolved_path!r} does not exist; "
+                f"falling back to in-process T5 forward"
+            )
+            resolved_path = None
+        self._t5_cache_path = resolved_path
+        # Default to None so encode_prompt / post_initialize can use a
+        # plain `is not None` check; attached at the end of __init__.
+        self._t5_cache = None
+        if self._t5_cache_path:
+            self.text_encoder = None
+            print(
+                f"[T5Cache] drop-T5 mode: skipping WanTextEncoder instantiation "
+                f"(cache={self._t5_cache_path})"
+            )
+        else:
+            self.text_encoder = instantiate(config.text_encoder_cfg)
         self.image_encoder = instantiate(config.image_encoder_cfg)
         self.vae = instantiate(config.vae_cfg)
         self.scheduler = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
+        # Keep 'text_encoder' even when self.text_encoder is None;
+        # experiment/base.py None-guards each entry.
         self.model_names = ['text_encoder']
 
-        self.num_inference_steps = 16 
+        self.num_inference_steps = 16
         self.seed = 1140
         self.cfg_scale = 5.0
         self.denoising_strength = 1.0
@@ -239,11 +277,12 @@ class WANPolicyHead(ActionHead):
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
         
-        text_enc_path = ensure_file(
-            self.text_encoder.text_encoder_pretrained_path,
-            "models_t5_umt5-xxl-enc-bf16.pth",
-        )
-        self.text_encoder.load_state_dict(torch.load(text_enc_path, map_location='cpu'))
+        if self.text_encoder is not None:
+            text_enc_path = ensure_file(
+                self.text_encoder.text_encoder_pretrained_path,
+                "models_t5_umt5-xxl-enc-bf16.pth",
+            )
+            self.text_encoder.load_state_dict(torch.load(text_enc_path, map_location='cpu'))
 
         img_enc_path = ensure_file(
             self.image_encoder.image_encoder_pretrained_path,
@@ -308,6 +347,13 @@ class WANPolicyHead(ActionHead):
                     print(f"Unexpected keys when loading pretrained weights: {unexpected_keys}")
 
                 print("Successfully loaded pretrained weights")
+
+                # DiT-block torch.compile must run AFTER load_state_dict —
+                # OptimizedModule's `_orig_mod.` key prefix would otherwise
+                # make every WAN-pretrained DiT key report as missing, and
+                # the model would silently train DiT blocks from scratch.
+                if hasattr(self.model, "compile_dit_blocks"):
+                    self.model.compile_dit_blocks()
         else:
             print("Skipping individual component loading (loading from full pretrained model)")
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
@@ -321,6 +367,25 @@ class WANPolicyHead(ActionHead):
         self.defer_lora_injection = config.defer_lora_injection
         print("defer_lora_injection@@", self.defer_lora_injection)
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
+
+        # Opt-in torch.compile of encode_video / encode_image. Must run
+        # after load_state_dict: the compile call consumes dynamo RNG, which
+        # would shift global RNG seen by missing-key modules at init.
+        if os.environ.get("DREAMZERO_COMPILE_ENCODERS", "0") == "1":
+            _enc_mode = os.environ.get("DREAMZERO_COMPILE_MODE", "default")
+            _enc_dynamic = os.environ.get("DREAMZERO_COMPILE_DYNAMIC", "0") == "1"
+            _enc_fullgraph = os.environ.get("DREAMZERO_COMPILE_FULLGRAPH", "0") == "1"
+            print(
+                f"[DreamZero] torch.compile encoders (encode_video + encode_image): "
+                f"mode={_enc_mode}, dynamic={_enc_dynamic}, fullgraph={_enc_fullgraph}",
+                flush=True,
+            )
+            self.encode_video = torch.compile(
+                self.encode_video, mode=_enc_mode, dynamic=_enc_dynamic, fullgraph=_enc_fullgraph
+            )
+            self.encode_image = torch.compile(
+                self.encode_image, mode=_enc_mode, dynamic=_enc_dynamic, fullgraph=_enc_fullgraph
+            )
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector
@@ -358,11 +423,22 @@ class WANPolicyHead(ActionHead):
         else:
             self.print_trainable_params()
 
-        self.text_encoder.requires_grad_(False)
+        if self.text_encoder is not None:
+            self.text_encoder.requires_grad_(False)
         self.image_encoder.requires_grad_(False)
         self.vae.requires_grad_(False)
         if not self.defer_lora_injection:
             self.print_trainable_params()
+
+        # Attach the T5 prompt-embedding cache after every action-head
+        # submodule is built. Lookup is read-only, shared across ranks.
+        if self._t5_cache_path is not None:
+            from groot.vla.model.dreamzero.cache.t5_prompt_cache import T5PromptCache
+            self._t5_cache = T5PromptCache(self._t5_cache_path)
+            print(
+                f"[T5Cache] attached cache from {self._t5_cache_path} "
+                f"({self._t5_cache.entry_count} entries)"
+            )
 
 
     def print_trainable_params(self):
@@ -404,7 +480,8 @@ class WANPolicyHead(ActionHead):
             # self.model.registers.requires_grad_(True)
             # self.model.time_modality_projection.requires_grad_(True)
             
-            self.text_encoder.requires_grad_(False)
+            if self.text_encoder is not None:
+                self.text_encoder.requires_grad_(False)
             self.image_encoder.requires_grad_(False)
             self.vae.requires_grad_(False)
             self.print_trainable_params()
@@ -420,12 +497,19 @@ class WANPolicyHead(ActionHead):
         if self.training:
             if not self.tune_diffusion_model:
                 self.model.eval()
-            self.text_encoder.eval()
+            if self.text_encoder is not None:
+                self.text_encoder.eval()
             self.image_encoder.eval()
             self.vae.eval()
     
     
     def enable_vram_management(self, num_persistent_param_in_dit=None):
+        # Mutually exclusive with drop-T5 mode (cpu_offload already keeps T5
+        # off-GPU), and the .parameters() access below would crash on None.
+        assert self.text_encoder is not None, (
+            "enable_vram_management requires a live T5 encoder; "
+            "unset DREAMZERO_T5_CACHE_PATH to use the cpu-offload path."
+        )
         dtype = next(iter(self.text_encoder.parameters())).dtype
         enable_vram_management(
             self.text_encoder,
@@ -540,6 +624,15 @@ class WANPolicyHead(ActionHead):
         return image
 
     def encode_prompt(self, input_ids, attention_mask):
+        if self._t5_cache is not None:
+            cached = self._t5_cache.lookup_batch(input_ids)
+            if cached is not None:
+                return cached
+            raise RuntimeError(
+                "T5 cache miss but the T5 encoder was dropped to free GPU memory. "
+                "Either rebuild the cache to cover this prompt, "
+                "or unset DREAMZERO_T5_CACHE_PATH to fall back to live T5 forward."
+            )
         seq_lens = attention_mask.gt(0).sum(dim=1).long()
         prompt_emb = self.text_encoder(input_ids, attention_mask)
         prompt_emb = prompt_emb.clone().to(dtype=torch.bfloat16)
@@ -763,12 +856,12 @@ class WANPolicyHead(ActionHead):
                 video_noise_pred, action_noise_pred = self.model(
                     noisy_latents.transpose(1, 2), timestep=timestep, clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
                     state=state_features, embodiment_id=embodiment_id,
-                    action=noisy_actions, timestep_action=timestep_action, 
+                    action=noisy_actions, timestep_action=timestep_action,
                     clean_x=latents.transpose(1, 2),
                 )
             else:
                 video_noise_pred, action_noise_pred = self.model(
-                    noisy_latents.transpose(1, 2), timestep=timestep, timestep_action=timestep_action, 
+                    noisy_latents.transpose(1, 2), timestep=timestep, timestep_action=timestep_action,
                     clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
                     state=state_features, embodiment_id=embodiment_id,
                     clean_x=latents.transpose(1, 2),
@@ -787,12 +880,12 @@ class WANPolicyHead(ActionHead):
 
             weight_dynamics = dynamics_loss_per_sample * self.scheduler.training_weight(timestep.flatten(0, 1)).unflatten(0, (noise.shape[0], noise.shape[1])).to(self._device)
             weighted_dynamics_loss = weight_dynamics.mean()
-            
+
             if actions.numel() > 0:
                 action_loss_per_sample = torch.nn.functional.mse_loss(
                     action_noise_pred.float(), training_target_action.float(), reduction='none'
                 ) * action_mask  # shape: [B, ...]
-                action_loss_per_sample = has_real_action[:, None].float() * action_loss_per_sample  # apply has_real_action
+                action_loss_per_sample = has_real_action[:, None, None].float() * action_loss_per_sample  # apply has_real_action (broadcast over [B,T,D])
                 weight_action = action_loss_per_sample.mean(dim=2) * self.scheduler.training_weight(
                     timestep_action.flatten(0, 1),
                 ).unflatten(0, (noise_action.shape[0], noise_action.shape[1])).to(self._device)
@@ -1350,12 +1443,19 @@ class WANPolicyHead(ActionHead):
 
     def post_initialize(self):
         # Move models to the cuda device and set the dtype to bfloat16.
+        # Not called on the dreamzero training path (HF Trainer + DeepSpeed
+        # handle device/dtype). Kept for inference callers (sim_policy.py).
         print("Moving models to the cuda device and setting the dtype to bfloat16.")
         self.model.to(device=self._device, dtype=torch.bfloat16)
-        self.text_encoder.to(device=self._device, dtype=torch.bfloat16)
+
+        # T5 prompt cache state was set in __init__; honour it here as well.
+        cache_path = getattr(self, "_t5_cache_path", None)
+        drop_t5 = bool(cache_path)
+
+        if not drop_t5 and self.text_encoder is not None:
+            self.text_encoder.to(device=self._device, dtype=torch.bfloat16)
         self.image_encoder.to(device=self._device, dtype=torch.bfloat16)
         self.vae.to(device=self._device, dtype=torch.bfloat16)
-        import os
         ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
         LOAD_TRT_ENGINE = os.getenv("LOAD_TRT_ENGINE", None)
 
@@ -1364,9 +1464,10 @@ class WANPolicyHead(ActionHead):
         if not ENABLE_TENSORRT:
             print("Torch compiling the TextEncoder, ImageEncoder, and VAE modules (Wan _forward_blocks not compiled).")
 
-            self.text_encoder.forward = torch.compile(
-                mode="reduce-overhead", fullgraph=True, dynamic=False,
-            )(self.text_encoder.forward)
+            if not drop_t5 and self.text_encoder is not None:
+                self.text_encoder.forward = torch.compile(
+                    mode="reduce-overhead", fullgraph=True, dynamic=False,
+                )(self.text_encoder.forward)
 
             self.image_encoder.model.visual.forward = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
@@ -1375,7 +1476,17 @@ class WANPolicyHead(ActionHead):
             self.vae.model.encode = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
             )(self.vae.model.encode)
-        
+
+        # Defensive re-attach for any caller that hits post_initialize
+        # without going through __init__ first.
+        if cache_path is not None and self._t5_cache is None:
+            from groot.vla.model.dreamzero.cache.t5_prompt_cache import T5PromptCache
+            self._t5_cache = T5PromptCache(cache_path)
+            print(
+                f"[T5Cache] post_init attach: cache from {cache_path} "
+                f"({self._t5_cache.entry_count} entries)"
+            )
+
         self.trt_engine = None
         if LOAD_TRT_ENGINE is not None:
             print(f"Loading TRT engine from {LOAD_TRT_ENGINE}")

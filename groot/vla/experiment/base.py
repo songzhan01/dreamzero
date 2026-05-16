@@ -578,6 +578,10 @@ class BaseTrainer(transformers.Trainer):
         # persistent_workers is only valid when num_workers > 0 (PyTorch raises otherwise)
         if self.args.dataloader_num_workers > 0:
             dataloader_params["persistent_workers"] = self.args.dataloader_persistent_workers
+            # prefetch_factor is also only valid when num_workers > 0; HF TrainingArguments exposes it
+            prefetch_factor = getattr(self.args, "dataloader_prefetch_factor", None)
+            if prefetch_factor is not None:
+                dataloader_params["prefetch_factor"] = prefetch_factor
 
         return DataLoader(train_dataset, **dataloader_params)
 
