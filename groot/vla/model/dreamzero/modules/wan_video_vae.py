@@ -1141,7 +1141,7 @@ class WanVideoVAE(nn.Module):
         return values
 
     def tiled_encode(self, video, tile_size, tile_stride):
-        _, _, T, H, W = video.shape
+        B, _, T, H, W = video.shape
         size_h, size_w = tile_size
         stride_h, stride_w = tile_stride
 
@@ -1156,12 +1156,12 @@ class WanVideoVAE(nn.Module):
 
         out_T = (T + 3) // 4
         weight = torch.zeros(
-            (1, 1, out_T, H // self.upsampling_factor, W // self.upsampling_factor),
+            (B, 1, out_T, H // self.upsampling_factor, W // self.upsampling_factor),
             dtype=video.dtype,
             device=video.device,
         )
         values = torch.zeros(
-            (1, self.z_dim, out_T, H // self.upsampling_factor, W // self.upsampling_factor),
+            (B, self.z_dim, out_T, H // self.upsampling_factor, W // self.upsampling_factor),
             dtype=video.dtype,
             device=video.device,
         )
@@ -1206,19 +1206,13 @@ class WanVideoVAE(nn.Module):
         return video.clamp_(-1, 1)
 
     def encode(self, videos, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
-        hidden_states = []
-        for video in videos:
-            video = video.unsqueeze(0)
-            if tiled:
-                tile_size = (tile_size[0] * self.upsampling_factor, tile_size[1] * self.upsampling_factor)
-                tile_stride = (tile_stride[0] * self.upsampling_factor, tile_stride[1] * self.upsampling_factor)
-                hidden_state = self.tiled_encode(video, tile_size, tile_stride)
-            else:
-                hidden_state = self.single_encode(video)
-            hidden_state = hidden_state.squeeze(0)
-            hidden_states.append(hidden_state)
-        hidden_states = torch.stack(hidden_states)
-        return hidden_states
+        if videos.dim() == 4:
+            videos = videos.unsqueeze(0)
+        if tiled:
+            tile_size = (tile_size[0] * self.upsampling_factor, tile_size[1] * self.upsampling_factor)
+            tile_stride = (tile_stride[0] * self.upsampling_factor, tile_stride[1] * self.upsampling_factor)
+            return self.tiled_encode(videos, tile_size, tile_stride)
+        return self.single_encode(videos)
 
     def decode(self, hidden_states, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
         if tiled:

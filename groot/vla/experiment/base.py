@@ -373,6 +373,7 @@ class BaseTrainer(transformers.Trainer):
         return BaseSampler(eval_dataset, shuffle=False)
 
     def training_step(self, model, inputs, num_items_in_batch=None):
+        torch.compiler.cudagraph_mark_step_begin()
         enable_profile = self.enable_profiling and self.current_step % self.profiling_steps == 0
         if enable_profile:
             profile_context = profile(
@@ -578,6 +579,10 @@ class BaseTrainer(transformers.Trainer):
         # persistent_workers is only valid when num_workers > 0 (PyTorch raises otherwise)
         if self.args.dataloader_num_workers > 0:
             dataloader_params["persistent_workers"] = self.args.dataloader_persistent_workers
+            # prefetch_factor is also only valid when num_workers > 0; HF TrainingArguments exposes it
+            prefetch_factor = getattr(self.args, "dataloader_prefetch_factor", None)
+            if prefetch_factor is not None:
+                dataloader_params["prefetch_factor"] = prefetch_factor
 
         return DataLoader(train_dataset, **dataloader_params)
 

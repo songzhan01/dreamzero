@@ -29,6 +29,23 @@ def basic_clean(text):
     text = html.unescape(html.unescape(text))
     return text.strip()
 
+
+# Single source of truth for the WAN classifier-free-guidance negative prompt.
+# Used both by the runtime collator (transformed_data["text_negative"] below)
+# and by the offline T5 cache builder (scripts/encode_t5_offline.py imports
+# this name). Changing it invalidates every cached negative-prompt entry; the
+# builder and runtime both hash post-tokenizer input_ids, so a string edit
+# will surface as a cache miss in drop-T5 mode (RuntimeError) — rebuild via
+# `scripts/encode_t5_offline.py` after any edit.
+NEG_PROMPT = (
+    "Vibrant colors, overexposed, static, blurry details, text, subtitles, "
+    "style, artwork, painting, image, still, grayscale, dull, worst quality, "
+    "low quality, JPEG artifacts, ugly, mutilated, extra fingers, bad hands, "
+    "bad face, deformed, disfigured, mutated limbs, fused fingers, stagnant "
+    "image, cluttered background, three legs, many people in the background, "
+    "walking backwards."
+)
+
 def whitespace_clean(text):
     text = re.sub(r'\s+', ' ', text)
     text = text.strip()
@@ -160,7 +177,19 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
             batch['text_attention_mask_negative'] = mask
         else:
             values = [elem[key] for elem in features]
-            batch[key] = torch.from_numpy(np.stack(values))
+            try:
+                batch[key] = torch.from_numpy(np.stack(values))
+            except ValueError as e:
+                # After Plan A (dataset-level skip of incomplete-chunk samples in
+                # lerobot_sharded._uniform_sample_from_language_ranges), all samples
+                # must be homogeneous on every axis. If this fires, a new ragged
+                # path has leaked into the data pipeline — surface the shape map
+                # rather than silently padding.
+                shapes = [np.asarray(v).shape for v in values]
+                raise ValueError(
+                    f"collate: ragged key={key!r} shapes={shapes}. "
+                    f"Dataset-level chunk filter should prevent this."
+                ) from e
     return batch
 
 
@@ -535,7 +564,7 @@ class DreamTransform(InvertibleModalityTransform):
             transformed_data["lapa_action"] = np.zeros_like(transformed_data["action"])
             transformed_data["lapa_action_mask"] = np.zeros_like(transformed_data["action_mask"])
         # else:
-        transformed_data["text_negative"] = "Vibrant colors, overexposed, static, blurry details, text, subtitles, style, artwork, painting, image, still, grayscale, dull, worst quality, low quality, JPEG artifacts, ugly, mutilated, extra fingers, bad hands, bad face, deformed, disfigured, mutated limbs, fused fingers, stagnant image, cluttered background, three legs, many people in the background, walking backwards."
+        transformed_data["text_negative"] = NEG_PROMPT
 
         for k, v in vlm_outputs.items():
             assert k not in transformed_data, f"Key {k} already exists in transformed_data."

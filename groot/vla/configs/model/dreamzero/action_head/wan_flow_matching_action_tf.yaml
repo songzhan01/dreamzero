@@ -87,6 +87,11 @@ action_head_cfg:
       _convert_: object
       vae_pretrained_path: ${vae_pretrained_path}
 
+    # Optional T5 prompt embedding cache. To use it: run
+    # scripts/encode_t5_offline.py to build the cache on shared storage,
+    # then point this field (or DREAMZERO_T5_CACHE_PATH) at that path.
+    t5_cache_path: ./caches/t5_droid_full
+
     action_dim: ${max_action_dim}
     action_horizon: ${action_horizon}
     num_inference_timesteps: 4  # not used during training

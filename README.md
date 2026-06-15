@@ -206,6 +206,22 @@ If you want to reproduce the dataset conversion from raw DROID 1.0.1 yourself (o
 
 ### Running Training
 
+#### 1) Precompute T5 prompt embedding cache (recommended)
+
+T5 / UMT5-XXL is frozen during DreamZero training but loads ~11 GB onto every GPU. If you precompute the prompt embeddings once, DreamZero will skip loading the T5 encoder entirely at training time and look up embeddings from the cache. If you skip this step, training automatically loads T5 and encodes prompts in-process as before.
+
+```bash
+python scripts/encode_t5_offline.py \
+    --droid-data-root ./data/droid_lerobot \
+    --t5-checkpoint ./checkpoints/Wan2.1-I2V-14B-480P/models_t5_umt5-xxl-enc-bf16.pth \
+    --tokenizer-path ./checkpoints/umt5-xxl \
+    --output-dir ./caches/t5_droid_full
+```
+
+Set `DREAMZERO_T5_CACHE_PATH` to the LMDB cache directory to enable cache lookup; leave it unset to fall back to the in-process T5 forward.
+
+#### 2) Launch training
+
 ```bash
 # Configure paths (override defaults as needed)
 export DROID_DATA_ROOT="./data/droid_lerobot"
@@ -215,6 +231,9 @@ export NUM_GPUS=4
 # Point to your downloaded model weights (if not using default paths)
 export WAN_CKPT_DIR="./checkpoints/Wan2.1-I2V-14B-480P"
 export TOKENIZER_DIR="./checkpoints/umt5-xxl"
+
+# Optional: enable the T5 cache built in step 1 (drops T5 from GPU)
+export DREAMZERO_T5_CACHE_PATH=./caches/t5_droid_full
 
 # Launch training
 bash scripts/train/droid_training.sh

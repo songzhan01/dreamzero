@@ -1,5 +1,6 @@
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 import time
 
@@ -1228,14 +1229,30 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         
         # ensure that unique_sorted has 4n+1 frames
         assert unique_sorted.size % 8 == 1, f"unique_sorted size {unique_sorted.size} is not 4n+1"
-        
+
         # Store the number of chunks for alignment with action/state
         num_video_chunks = (unique_sorted.size - 1) // 8
         if not hasattr(self, '_current_num_chunks'):
             self._current_num_chunks = {}
         # Use first_idx as a key to track the current sample's chunk count
         self._current_num_chunks[first_idx] = num_video_chunks
-        
+
+        # When BS > 1 the collator needs every sample to share the same
+        # chunk count so it can plain-np.stack along the batch axis. Drop
+        # short tail samples (fewer than max_chunk_size) in that case; with
+        # BS=1 they are kept as-is.
+        bs_env = int(os.environ.get("BS", "1"))
+        if bs_env > 1 and num_video_chunks < self.max_chunk_size:
+            n = getattr(self, "_skipped_short_chunk_count", 0) + 1
+            self._skipped_short_chunk_count = n
+            if n <= 5 or n % 1000 == 0:
+                print(
+                    f"[ShardedDataset] WARN: BS={bs_env}>1 dropped sample "
+                    f"with {num_video_chunks} chunks < max_chunk_size="
+                    f"{self.max_chunk_size} (total dropped so far: {n})"
+                )
+            return np.array([], dtype=int)
+
         # print("unique_sorted size", unique_sorted.size, "num_video_chunks", num_video_chunks)
         return unique_sorted
 
