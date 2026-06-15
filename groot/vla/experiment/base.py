@@ -373,6 +373,7 @@ class BaseTrainer(transformers.Trainer):
         return BaseSampler(eval_dataset, shuffle=False)
 
     def training_step(self, model, inputs, num_items_in_batch=None):
+        torch.compiler.cudagraph_mark_step_begin()
         enable_profile = self.enable_profiling and self.current_step % self.profiling_steps == 0
         if enable_profile:
             profile_context = profile(

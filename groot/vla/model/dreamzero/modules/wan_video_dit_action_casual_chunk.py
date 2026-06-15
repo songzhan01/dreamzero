@@ -1427,7 +1427,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.independent_first_frame = False if self.num_frame_per_block == 1 else True
 
     def compile_dit_blocks(self):
-        """Env-gated torch.compile of DiT blocks.
+        """Env-gated torch.compile of DiT blocks and attention sub-methods.
 
         Must be called AFTER loading the pretrained WAN checkpoint:
         torch.compile wraps each block in OptimizedModule and adds a
@@ -1438,9 +1438,28 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if os.environ.get("DREAMZERO_COMPILE", "0") != "1":
             return
         _mode = os.environ.get("DREAMZERO_COMPILE_MODE", "default")
+        _attn_mode = os.environ.get("DREAMZERO_COMPILE_ATTN_MODE", "max-autotune-no-cudagraphs")
         print(f"[DreamZero] torch.compile {len(self.blocks)} DiT blocks (mode={_mode})", flush=True)
         for i in range(len(self.blocks)):
             self.blocks[i] = torch.compile(self.blocks[i], mode=_mode)
+        # Compile hot attention sub-methods with autotune for kernel optimization
+        if os.environ.get("DREAMZERO_COMPILE_ATTN", "1") == "1":
+            _dynamo = torch._dynamo
+            _dynamo.config.cache_size_limit = 1000
+            _dynamo.config.accumulated_cache_size_limit = 1000
+            n_compiled = 0
+            for block in self.blocks:
+                attn = getattr(block, '_orig_mod', block).self_attn if hasattr(getattr(block, '_orig_mod', block), 'self_attn') else None
+                if attn is None:
+                    continue
+                for method_name in ('_process_clean_image_only', '_process_state_blocks',
+                                    '_process_noisy_image_blocks', '_process_noisy_action_blocks'):
+                    if hasattr(attn, method_name):
+                        setattr(attn, method_name, torch.compile(
+                            getattr(attn, method_name), mode=_attn_mode))
+                n_compiled += 1
+            if n_compiled > 0:
+                print(f"[DreamZero] torch.compile attention sub-methods on {n_compiled} blocks (mode={_attn_mode})", flush=True)
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
